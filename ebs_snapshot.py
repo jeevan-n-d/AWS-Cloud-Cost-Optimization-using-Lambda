@@ -3,7 +3,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 ec2 = boto3.client("ec2")
-sns = boto3.client("sns", region_name="ap-northeast-2")
+sns = boto3.client("sns")
 
 TOPIC_ARN = os.environ["TOPIC_ARN"]
 
