@@ -3,7 +3,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 ec2 = boto3.client("ec2")
-sns = boto3.client("sns", region_name="ap-south-1")
+sns = boto3.client("sns", region_name="ap-northeast-2")
 
 TOPIC_ARN = os.environ["TOPIC_ARN"]
 
@@ -22,7 +22,7 @@ def lambda_handler(event, context):
 
         print(f"Checking {snapshot_id}")
 
-        # Get tags
+        # Get snapshot tags
         tags = snapshot.get("Tags", [])
 
         env_prod = any(
@@ -30,46 +30,70 @@ def lambda_handler(event, context):
             for tag in tags
         )
 
-        # If VolumeId is missing
-        if not volume_id:
+        # ----------------------------------------
+        # NEVER DELETE PRODUCTION SNAPSHOTS
+        # ----------------------------------------
+
+        if env_prod:
+
+            kept_snapshots.append(
+                f"{snapshot_id} - KEPT - env=prod"
+            )
 
             print(
-                f"Deleting {snapshot_id} "
-                f"because VolumeId is missing"
-            )
-
-            ec2.delete_snapshot(
-                SnapshotId=snapshot_id
-            )
-
-            deleted_snapshots.append(
-                f"{snapshot_id} - VolumeId missing"
+                f"Keeping {snapshot_id} because env=prod"
             )
 
             continue
 
+        # ----------------------------------------
+        # Check VolumeId
+        # ----------------------------------------
+
+        if not volume_id:
+
+            print(
+                f"Deleting {snapshot_id} - "
+                f"VolumeId is missing"
+            )
+
+            try:
+
+                ec2.delete_snapshot(
+                    SnapshotId=snapshot_id
+                )
+
+                deleted_snapshots.append(
+                    f"{snapshot_id} - DELETED - VolumeId missing"
+                )
+
+            except ClientError as e:
+
+                print(
+                    f"Could not delete {snapshot_id}: {e}"
+                )
+
+            continue
+
+        # ----------------------------------------
+        # Check whether source volume exists
+        # ----------------------------------------
+
         try:
 
-            # Check whether source volume exists
             ec2.describe_volumes(
                 VolumeIds=[volume_id]
             )
 
             # Volume exists
-            if env_prod:
-
-                reason = "Volume exists, env=prod"
-
-            else:
-
-                reason = "Volume exists"
-
             kept_snapshots.append(
-                f"{snapshot_id} - KEPT - {reason}"
+                f"{snapshot_id} - KEPT - "
+                f"Volume {volume_id} exists"
             )
 
             print(
-                f"Keeping {snapshot_id} - {reason}"
+                f"Keeping {snapshot_id} - "
+                f"Volume {volume_id} exists"
             )
 
         except ClientError as e:
@@ -78,30 +102,68 @@ def lambda_handler(event, context):
             if e.response["Error"]["Code"] == "InvalidVolume.NotFound":
 
                 print(
-                    f"Deleting {snapshot_id} because "
-                    f"volume {volume_id} no longer exists"
+                    f"Deleting {snapshot_id} - "
+                    f"Volume {volume_id} no longer exists"
                 )
 
-                ec2.delete_snapshot(
-                    SnapshotId=snapshot_id
-                )
+                try:
 
-                deleted_snapshots.append(
-                    f"{snapshot_id} - Volume {volume_id} no longer exists"
-                )
+                    ec2.delete_snapshot(
+                        SnapshotId=snapshot_id
+                    )
+
+                    deleted_snapshots.append(
+                        f"{snapshot_id} - DELETED - "
+                        f"Volume {volume_id} no longer exists"
+                    )
+
+                except ClientError as delete_error:
+
+                    print(
+                        f"Could not delete "
+                        f"{snapshot_id}: {delete_error}"
+                    )
 
             else:
 
                 print(
-                    f"Error checking volume {volume_id}: {e}"
+                    f"Error checking volume "
+                    f"{volume_id}: {e}"
                 )
 
-    # Create notification
-    message = "AWS EBS Snapshot Cleanup Report\n\n"
+                kept_snapshots.append(
+                    f"{snapshot_id} - ERROR - "
+                    f"Could not check volume"
+                )
 
-    # Existing / kept snapshots
-    message += "EXISTING SNAPSHOTS:\n"
-    message += "-------------------\n"
+    # ============================================
+    # CREATE EMAIL REPORT
+    # ============================================
+
+    message = "AWS EBS Snapshot Cleanup Report\n"
+    message += "================================\n\n"
+
+    message += (
+        f"Total Snapshots Checked: "
+        f"{len(response['Snapshots'])}\n"
+    )
+
+    message += (
+        f"Total Snapshots Kept: "
+        f"{len(kept_snapshots)}\n"
+    )
+
+    message += (
+        f"Total Snapshots Deleted: "
+        f"{len(deleted_snapshots)}\n\n"
+    )
+
+    # --------------------------------------------
+    # KEPT SNAPSHOTS
+    # --------------------------------------------
+
+    message += "KEPT SNAPSHOTS\n"
+    message += "--------------\n"
 
     if kept_snapshots:
 
@@ -112,9 +174,12 @@ def lambda_handler(event, context):
 
         message += "No snapshots were kept.\n"
 
-    # Deleted snapshots
-    message += "\nDELETED SNAPSHOTS:\n"
-    message += "------------------\n"
+    # --------------------------------------------
+    # DELETED SNAPSHOTS
+    # --------------------------------------------
+
+    message += "\nDELETED SNAPSHOTS\n"
+    message += "----------------\n"
 
     if deleted_snapshots:
 
@@ -125,17 +190,25 @@ def lambda_handler(event, context):
 
         message += "No snapshots were deleted.\n"
 
-    # Send SNS notification
+    # ============================================
+    # ALWAYS SEND SNS EMAIL
+    # ============================================
+
     sns.publish(
         TopicArn=TOPIC_ARN,
         Subject="EBS Snapshot Cleanup Report",
         Message=message
     )
 
-    print("SNS Notification Sent")
+    print("SNS notification sent successfully.")
+
+    # ============================================
+    # LAMBDA RESPONSE
+    # ============================================
 
     return {
         "statusCode": 200,
+        "TotalSnapshots": len(response["Snapshots"]),
         "DeletedSnapshots": deleted_snapshots,
         "KeptSnapshots": kept_snapshots
     }
