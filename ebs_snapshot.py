@@ -3,7 +3,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 ec2 = boto3.client("ec2")
-sns = boto3.client("sns")
+sns = boto3.client("sns", region_name="ap-south-1")
 
 TOPIC_ARN = os.environ["TOPIC_ARN"]
 
@@ -13,6 +13,7 @@ def lambda_handler(event, context):
     response = ec2.describe_snapshots(OwnerIds=["self"])
 
     deleted_snapshots = []
+    kept_snapshots = []
 
     for snapshot in response["Snapshots"]:
 
@@ -21,7 +22,7 @@ def lambda_handler(event, context):
 
         print(f"Checking {snapshot_id}")
 
-        # Check snapshot tag
+        # Get tags
         tags = snapshot.get("Tags", [])
 
         env_prod = any(
@@ -29,52 +30,112 @@ def lambda_handler(event, context):
             for tag in tags
         )
 
-        # Keep production snapshots
-        if env_prod:
-            print(f"Keeping {snapshot_id} because env=prod")
+        # If VolumeId is missing
+        if not volume_id:
+
+            print(
+                f"Deleting {snapshot_id} "
+                f"because VolumeId is missing"
+            )
+
+            ec2.delete_snapshot(
+                SnapshotId=snapshot_id
+            )
+
+            deleted_snapshots.append(
+                f"{snapshot_id} - VolumeId missing"
+            )
+
             continue
 
         try:
 
-            # Check if volume exists
+            # Check whether source volume exists
             ec2.describe_volumes(
                 VolumeIds=[volume_id]
             )
 
+            # Volume exists
+            if env_prod:
+
+                reason = "Volume exists, env=prod"
+
+            else:
+
+                reason = "Volume exists"
+
+            kept_snapshots.append(
+                f"{snapshot_id} - KEPT - {reason}"
+            )
+
+            print(
+                f"Keeping {snapshot_id} - {reason}"
+            )
+
         except ClientError as e:
 
-            # Volume already deleted
+            # Source volume does not exist
             if e.response["Error"]["Code"] == "InvalidVolume.NotFound":
+
+                print(
+                    f"Deleting {snapshot_id} because "
+                    f"volume {volume_id} no longer exists"
+                )
 
                 ec2.delete_snapshot(
                     SnapshotId=snapshot_id
                 )
 
-                deleted_snapshots.append(snapshot_id)
+                deleted_snapshots.append(
+                    f"{snapshot_id} - Volume {volume_id} no longer exists"
+                )
 
-                print(f"Deleted {snapshot_id}")
+            else:
 
-    # Send Email
+                print(
+                    f"Error checking volume {volume_id}: {e}"
+                )
+
+    # Create notification
+    message = "AWS EBS Snapshot Cleanup Report\n\n"
+
+    # Existing / kept snapshots
+    message += "EXISTING SNAPSHOTS:\n"
+    message += "-------------------\n"
+
+    if kept_snapshots:
+
+        for snapshot in kept_snapshots:
+            message += snapshot + "\n"
+
+    else:
+
+        message += "No snapshots were kept.\n"
+
+    # Deleted snapshots
+    message += "\nDELETED SNAPSHOTS:\n"
+    message += "------------------\n"
+
     if deleted_snapshots:
-
-        message = "Deleted Snapshots:\n\n"
 
         for snapshot in deleted_snapshots:
             message += snapshot + "\n"
 
-        sns.publish(
-            TopicArn=TOPIC_ARN,
-            Subject="EBS Snapshot Cleanup Report",
-            Message=message
-        )
-
-        print("SNS Notification Sent")
-
     else:
 
-        print("No snapshots deleted.")
+        message += "No snapshots were deleted.\n"
+
+    # Send SNS notification
+    sns.publish(
+        TopicArn=TOPIC_ARN,
+        Subject="EBS Snapshot Cleanup Report",
+        Message=message
+    )
+
+    print("SNS Notification Sent")
 
     return {
         "statusCode": 200,
-        "DeletedSnapshots": deleted_snapshots
+        "DeletedSnapshots": deleted_snapshots,
+        "KeptSnapshots": kept_snapshots
     }
